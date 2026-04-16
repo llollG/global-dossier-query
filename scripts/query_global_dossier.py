@@ -337,12 +337,14 @@ async def get_member_dossier(page, member: dict, output_dir: Path) -> dict:
 def parse_documents_from_text(text: str) -> list[dict]:
     """
     从 All Docs 页面文本中提取文件列表。
-    Global Dossier 文档列表格式大致为：
-        文件名 \n 日期 \n 下载链接文字
-    返回 [{"date": ..., "name": ...}, ...]
+    Global Dossier 页面有多种格式：
+      1. 多行格式（US/EP 等）：文件名在单独一行，下一行是日期
+      2. 单行格式（JP/KR/CN/AU/CA 等）："名称 \\t 日期 \\t Code \\t Group" 合在一行
+
+    返回 [{"date": ..., "name": ...}, ...]，按日期降序排列。
     """
     docs = []
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    lines = [l.rstrip() for l in text.splitlines()]
 
     # 找到文档列表起始位置
     start_idx = 0
@@ -351,95 +353,359 @@ def parse_documents_from_text(text: str) -> list[dict]:
             start_idx = i
             break
 
-    # 日期正则（多种格式）
+    # 日期正则（支持多种格式）
     date_pattern = re.compile(
         r"\b(\d{4}/\d{2}/\d{2}|\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})\b"
     )
 
+    # ── 策略1：单行格式（Tab 分隔：名称  日期  Code  Group）──
+    # 特征：行以 "U" 开头（或以空格+Tab 开头），含 Tab 和日期
+    tab_lines_docs = []
+    for line in lines[start_idx:]:
+        stripped = line.strip()
+        # 跳过控件行
+        if re.match(r"^(Download|View|Open|PDF|Pages|View All|Doc List|Options|Description|Date|Code|Group)$",
+                    stripped, re.IGNORECASE):
+            continue
+        if "\t" not in line:
+            continue
+        date_match = date_pattern.search(line)
+        if date_match:
+            parts = line.split("\t")
+            # 文件名是第一个非空部分
+            doc_name = ""
+            for part in parts:
+                if part.strip():
+                    doc_name = part.strip()
+                    break
+            if not doc_name:
+                continue
+            doc_date = date_match.group(0)
+            tab_lines_docs.append({"date": doc_date, "name": doc_name})
+
+    # ── 策略2：多行格式（文件名一行，下一行日期）──
+    multi_lines_docs = []
+    raw_lines = [l.strip() for l in lines]
     i = start_idx
-    while i < len(lines):
-        line = lines[i]
-        # 跳过仅含 Download / View 等控件文字的行
+    while i < len(raw_lines):
+        line = raw_lines[i]
         if re.match(r"^(Download|View|Open|PDF|Pages|download|view)$", line, re.IGNORECASE):
             i += 1
             continue
-        # 若当前行或下一行包含日期，认为是一条文档记录
         date_match = date_pattern.search(line)
         if date_match:
-            # 文件名在上一行
-            doc_name = lines[i - 1] if i > 0 else line
+            doc_name = raw_lines[i - 1] if i > 0 else line
             doc_date = date_match.group(0)
-            docs.append({"date": doc_date, "name": doc_name})
+            multi_lines_docs.append({"date": doc_date, "name": doc_name})
         i += 1
 
+    # 优先用单行格式（JP/KR/CN/AU/CA 等局）
+    if tab_lines_docs:
+        docs = tab_lines_docs
+    else:
+        docs = multi_lines_docs
+
+    # 按日期降序排列
+    docs.sort(key=lambda d: d["date"], reverse=True)
     return docs
 
 
-def extract_status_from_text(text: str, office: str) -> str:
-    """从页面文本提取申请状态关键词。"""
-    text_lower = text.lower()
-    
-    # 中文关键词（CNIPA）
-    if office in ("CN",):
-        if "授权" in text or "patent granted" in text_lower:
-            return "✅ 已授权"
-        if "驳回" in text or "rejected" in text_lower:
-            return "❌ 已驳回"
-        if "撤回" in text or "withdrawn" in text_lower:
-            return "📁 已撤回"
-        if "视为撤回" in text:
+# ──────────────────────────────────────────────
+# 审查状态精准判断（基于案卷文档名称）
+# 优先级：视为撤回 > 驳回 > 授权 > 通知书在审 > 无通知书未审
+# ──────────────────────────────────────────────
+STATUS_ORDER = {
+    "📁 视为撤回": 0,
+    "❌ 已驳回": 1,
+    "✅ 已授权": 2,
+    "🔄 已发审查通知书在审": 3,
+    "🔄 无通知书未审": 4,
+    "❓ 无案卷数据": 5,
+}
+
+
+def detect_examination_status(office: str, docs: list[dict]) -> str:
+    """
+    基于案卷文档列表，精准判断审查状态。
+
+    判断逻辑（按优先级从高到低）：
+    - 视为撤回：任何文档名含 withdraw / 撤回 / 视为撤回
+    - 已驳回：驳回 / rejection / refusal / refuse / rejected
+    - 已授权：各局授权文件（见各局规则）
+    - 已发审查通知书在审：各局审查通知书文件（见各局规则）
+    - 无通知书未审：其他情况（实质审查中/待审）
+
+    Args:
+        office: 专利局代码（US/EP/JP/KR/CN/WIPO/PCT/AU/CA 等）
+        docs: 文档列表 [{"date": ..., "name": ...}, ...]
+
+    Returns:
+        五种审查状态之一：
+        "✅ 已授权"
+        "❌ 已驳回"
+        "📁 视为撤回"
+        "🔄 已发审查通知书在审"
+        "🔄 无通知书未审"
+    """
+    # 将所有文档名合并成大写字符串，供关键词匹配
+    all_names = " | ".join(d["name"].lower() for d in docs)
+
+    # ── 0. 检查是否有可用案卷 ────────────────────
+    if not docs or not all_names.strip():
+        no_docs_offices = {
+            "JP": "请访问 https://www.j-platpat.inpit.go.jp/ 查询",
+            "KR": "请访问 https://engportal.kipo.go.kr/ 查询",
+            "CN": "请访问 https://cpquery.cponline.cnipa.gov.cn/ 查询",
+            "AU": "请访问 https://search.ipaustralia.gov.au/ 查询",
+            "CA":  "请访问 https://ised-isde.canada.ca/cipo/ 查询",
+        }
+        hint = no_docs_offices.get(office, "该局案卷未在 Global Dossier 中同步")
+        return f"❓ 无案卷数据（{office}局：{hint}）"
+
+    # ── 1. 视为撤回（最高优先）────────────────────
+    withdraw_patterns = [
+        r"withdraw", r"withdrawn", r"withdrawal",
+        r"撤回", r"视为撤回", r"撤回专利", r"撤回申请",
+    ]
+    for p in withdraw_patterns:
+        if re.search(p, all_names, re.IGNORECASE):
             return "📁 视为撤回"
-        if "第一次审查意见" in text or "office action" in text_lower:
-            return "🔄 审查意见待复审"
-        if "补充检索" in text or "supplementary search" in text_lower:
-            return "🔄 补充检索完成，等待 OA"
-        if "第一次检索" in text or "first search" in text_lower:
-            return "🔄 检索完成，等待 OA"
-        return "🔄 实质审查中"
 
-    # KR
-    if office == "KR":
-        if "registration" in text_lower or "registered" in text_lower:
+    # ── 2. 各局授权文件（最高优先之一）──────────────
+    # 关键原则：一旦出现授权文件，即认定授权，不管是否曾发过通知书/曾被驳回
+    grant_patterns = {
+        "EP": [
+            r"decision\s+to\s+grant",
+            r"text\s+intended\s+for\s+grant",
+        ],
+        "US": [
+            r"issue\s+notification",
+            r"patent\s+issued",
+            r"patented",
+            r"notice\s+of\s+allowance",
+        ],
+        "JP": [
+            r"decision\s+to\s+grant",
+            r"patent\s+grant",
+            r"特许", r"特許",
+        ],
+        "KR": [
+            r"written\s+decision\s+on\s+registration",
+            r"registration\s+decision",
+            r"patent\s+registration",
+            r"등록\s*결정", r"등록특허",
+        ],
+        "CN": [
+            r"授权", r"授权公告", r"授权通知",
+            r"patent\s+grant",
+            r"certificate", r"登记手续", r"授予专利权",
+        ],
+        "WIPO": [r"iprp", r"chapt", r"wipo"],
+        "PCT":  [r"iprp", r"chapt", r"wipo"],
+        "AU":   [r"accepted", r"sealed", r"grant", r"patent\s+registration", r"notice\s+of\s+acceptance"],
+        "CA":   [r"patent\s+issued", r"registration", r"notice\s+of\s+allowance",
+                 r"final\s+fee", r"issue\s+fee", r"patent\s+granted"],
+    }
+    office_grant = grant_patterns.get(office, [])
+    for p in office_grant:
+        if re.search(p, all_names, re.IGNORECASE):
             return "✅ 已授权"
-        if "final rejection" in text_lower:
-            return "❌ 最终驳回"
-        if "abandoned" in text_lower:
-            return "📁 已放弃"
-        if "office action" in text_lower or "noa" in text_lower or "oa" in text_lower:
-            return "🔄 审查意见待复审"
-        return "🔄 实质审查中"
 
-    # EP
-    if office == "EP":
-        if "granted" in text_lower:
-            return "✅ 已授权"
-        if "refused" in text_lower:
-            return "❌ 已拒绝"
-        if "withdrawn" in text_lower:
-            return "📁 已撤回"
-        if "examination report" in text_lower or "office action" in text_lower:
-            return "🔄 审查报告待答复"
-        return "🔄 审查中"
-
-    # WIPO / PCT
-    if office in ("WIPO", "PCT"):
-        if "iprp" in text_lower or "chapter ii" in text_lower:
-            return "✅ PCT 程序完结（IPRP 已发出）"
-        if "chapter i" in text_lower:
-            return "✅ PCT 检索/审查完成"
-        return "✅ PCT 程序"
-
-    # US
+    # ── 3. US 特例：NOA + OA/RCE 并存 → 若有 Issue Notification = 授权 ─
+    #   常见场景：发出 NOA → 申请人提 RCE → 再次审查 → 最终 Issue Notification
     if office == "US":
-        if "patented" in text_lower or "issued" in text_lower:
-            return "✅ 已授权"
-        if "abandoned" in text_lower:
-            return "📁 已放弃"
-        if "office action" in text_lower:
-            return "🔄 审查意见待复审"
-        return "🔄 审查中"
+        has_noa   = re.search(r"notice\s+of\s+allowance", all_names, re.IGNORECASE)
+        has_issue = re.search(r"issue\s+notification", all_names, re.IGNORECASE)
+        if has_noa and has_issue:
+            return "✅ 已授权"   # Issue Notification 是最终授权证明
 
-    return "🔄 审查中"
+    # ── 4. 已发审查通知书（在授权之后判断，避免误判）───
+    oa_patterns = {
+        "EP": [
+            r"examination\s+report",
+            r"communication\s+from\s+examining\s+division",
+            r"office\s+action",
+        ],
+        "US": [
+            r"office\s+action",
+            r"non.?final\s+rejection",
+            r"final\s+rejection",
+            r"advisory\s+action",
+        ],
+        "JP": [
+            r"notice\s+of\s+reasons?\s+for\s+refusal",
+            r"reason\s+for\s+refusal",
+            r"審查", r"拒絶理由",
+            r"office\s+action",
+            r"written\s+opinion",
+        ],
+        "KR": [
+            r"request\s+for\s+submission\s+of\s+an?\s+opinion",
+            r"opinion\s+submission",
+            r"의견\s*제출",
+            r"office\s+action",
+            r"맞춤",
+        ],
+        "CN": [
+            r"审查意见", r"审查通知书", r"审查意见通知书",
+            r"驳回决定",
+            r"office\s+action",
+        ],
+        "AU": [
+            r"examination\s+report",
+            r"office\s+action",
+        ],
+        "CA": [
+            r"office\s+action",
+            r"examination\s+report",
+            r"examiner\s+requisition",
+        ],
+    }
+    office_oa = oa_patterns.get(office, [])
+    for p in office_oa:
+        if re.search(p, all_names, re.IGNORECASE):
+            return "🔄 已发审查通知书在审"
+
+    # EP 特殊：仅有 search report → 在审
+    if office == "EP":
+        ep_search = re.search(
+            r"european\s+search|extended\s+european\s+search|search\s+report",
+            all_names, re.IGNORECASE
+        )
+        if ep_search:
+            return "🔄 已发审查通知书在审"
+
+    # ── 5. 已驳回 ────────────────────────────────
+    # 注意：已发授权文件在上面已返回，不会误入此分支
+    reject_patterns = [
+        r"final\s+rejection",
+        r"abandoned\s+for\s+failure",
+        r"international\s+search\s+report.*refus",
+        r"驳回决定", r"已驳回",
+        r"decision\s+to\s+refuse",
+        r"deemed\s+withdrawn",
+    ]
+    for p in reject_patterns:
+        if re.search(p, all_names, re.IGNORECASE):
+            return "❌ 已驳回"
+
+    # ── 6. US NOA 发出但尚未 Issue Notification（被 RCE 撤销后重新审查中）──
+    if office == "US":
+        if re.search(r"notice\s+of\s+allowance", all_names, re.IGNORECASE):
+            # 有 NOA 但无 Issue Notification：可能被 RCE 撤销，仍在审查
+            return "🔄 已发审查通知书在审"
+
+
+    # ── 5. PCT 特殊处理 ──────────────────────────
+    if office in ("WIPO", "PCT"):
+        if any(re.search(r"international\s+search", all_names, re.IGNORECASE) for _ in [1]):
+            return "🔄 已发审查通知书在审"
+        return "✅ PCT 程序进行中"
+
+    # ── 6. 默认：未发通知书，实质审查中或待审 ──────
+    return "🔄 无通知书未审"
+
+
+def extract_status_from_text(text: str, office: str) -> str:
+    """
+    兼容旧接口：通过解析文档列表并调用精准判断函数。
+    """
+    docs = parse_documents_from_text(text)
+    if not docs:
+        # Fallback: 旧逻辑
+        return _fallback_status(text, office)
+    return detect_examination_status(office, docs)
+
+
+def _get_status_basis(office: str, docs: list[dict]) -> str:
+    """
+    返回判断状态所依据的文档名称（用于报告中说明状态来源）。
+    """
+    all_names_lower = " ".join(d["name"].lower() for d in docs)
+    matched = []
+
+    # 授权
+    grant_map = {
+        "EP": r"text intended for grant|decision to grant",
+        "US": r"notice of allowance|patent issued",
+        "JP": r"decision to grant|特许",
+        "KR": r"written decision on registration|등록결정",
+        "CN": r"授权|certificate|登记手续",
+    }
+    if office in grant_map and re.search(grant_map[office], all_names_lower):
+        p = grant_map[office]
+        for d in docs:
+            if re.search(p, d["name"].lower()):
+                matched.append(f"[授权] {d['name']}")
+                break
+
+    # 通知书
+    oa_map = {
+        "EP":  r"examination report",
+        "US":  r"office action|non.?final|final rejection",
+        "JP":  r"notice of reasons? for refusal|審查|拒絶理由",
+        "KR":  r"request for submission|의견\s*제출",
+        "CN":  r"审查意见|审查通知书",
+    }
+    if office in oa_map:
+        p = oa_map[office]
+        for d in docs:
+            if re.search(p, d["name"].lower()):
+                matched.append(f"[通知书] {d['name']}")
+                break
+
+    # 撤回
+    for d in docs:
+        if re.search(r"withdraw|撤回", d["name"].lower()):
+            matched.append(f"[撤回] {d['name']}")
+            break
+
+    # 驳回
+    for d in docs:
+        if re.search(r"reject|rejection|refus|驳回", d["name"].lower()):
+            matched.append(f"[驳回] {d['name']}")
+            break
+
+    return "; ".join(matched) if matched else ""
+
+
+def _fallback_status(text: str, office: str) -> str:
+    """无文档列表时的降级判断（用页面全文）。"""
+    text_lower = text.lower()
+
+    if "withdraw" in text_lower or "撤回" in text:
+        return "📁 视为撤回"
+    if re.search(r"reject|rejection|refus", text_lower) or "驳回" in text:
+        return "❌ 已驳回"
+
+    # 各局授权关键词
+    grant_keywords = {
+        "EP":  r"grant|text intended",
+        "US":  r"allowance|patent issued|patented",
+        "JP":  r"grant|特许",
+        "KR":  r"registration|등록",
+        "CN":  r"授权|certificate",
+        "WIPO": r"iprp",
+        "PCT":  r"iprp",
+    }
+    if office in grant_keywords and re.search(grant_keywords[office], text_lower):
+        return "✅ 已授权"
+
+    # 各局 OA 关键词
+    oa_keywords = {
+        "EP":  r"examination\s+report|office\s+action",
+        "US":  r"office\s+action|non.?final|final\s+rejection",
+        "JP":  r"notice\s+of\s+reasons?\s+for\s+refusal|審查|拒絶理由",
+        "KR":  r"request\s+for\s+submission|의견\s*제출",
+        "CN":  r"审查意见|审查通知书",
+    }
+    if office in oa_keywords and re.search(oa_keywords[office], text_lower):
+        return "🔄 已发审查通知书在审"
+
+    if office in ("WIPO", "PCT"):
+        return "✅ PCT 程序进行中"
+
+    return "🔄 无通知书未审"
 
 
 # ──────────────────────────────────────────────
@@ -482,6 +748,7 @@ def generate_report(app_number: str, search_result: dict, members_data: list[dic
 **查询案号：** CN {app_number}  
 **数据来源：** USPTO Global Dossier (<https://globaldossier.uspto.gov>)  
 **查询时间：** {now}  
+**状态判断依据：** 逐一点击各同族"View Dossier"获取全部案卷文件，基于各局授权/通知书/驳回/撤回等标志性文档名称精准判断
 
 ---
 
@@ -518,7 +785,15 @@ def generate_report(app_number: str, search_result: dict, members_data: list[dic
 
         report += f"### {office} — {app_num}\n\n"
         report += f"- **档案链接：** {m['url']}\n"
-        report += f"- **审查状态：** {status}\n\n"
+        report += f"- **审查状态：** {status}\n"
+
+        # 状态判断依据
+        docs = parse_documents_from_text(m["all_docs_text"])
+        if docs:
+            status_basis = _get_status_basis(office, docs)
+            if status_basis:
+                report += f"- **状态依据：** {status_basis}\n"
+        report += "\n"
 
         # Most Recent Documents（最近5条）
         recent_docs = extract_most_recent_docs(m["all_docs_text"], n=5)
