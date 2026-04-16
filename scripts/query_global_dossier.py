@@ -94,6 +94,114 @@ async def search_patent(page, app_number: str) -> dict:
     # 等待同族列表渲染
     await page.wait_for_timeout(8000)
 
+    # ── 勾选 NON-IP5 Office 复选框（显示 AU、CA 等非五局同族成员）
+    print("    勾选 NON-IP5 Office 复选框 ...")
+    non_ip5_found = False
+    # 尝试多种选择器匹配 NON-IP5 复选框
+    for selector in [
+        'input[type="checkbox"][id*="non" i]',
+        'input[type="checkbox"][id*="ip5" i]',
+        'label:has-text("NON-IP5") input[type="checkbox"]',
+        'label:has-text("Non-IP5") input[type="checkbox"]',
+        'input[type="checkbox"]',
+    ]:
+        try:
+            loc = page.locator(selector).first
+            cnt = await loc.count()
+            if cnt == 0:
+                continue
+            # 检查是否已勾选
+            is_checked = await loc.is_checked()
+            if not is_checked:
+                await loc.check(timeout=3000)
+                non_ip5_found = True
+                print("    NON-IP5 Office 复选框已勾选")
+            else:
+                non_ip5_found = True
+                print("    NON-IP5 Office 复选框已是勾选状态")
+            break
+        except Exception:
+            continue
+
+    if not non_ip5_found:
+        print("    [WARN] 未找到 NON-IP5 Office 复选框，尝试通过 JavaScript 查找 ...")
+        # 降级：通过 JS 查找含 NON-IP5 文本的 checkbox
+        js_checked = await page.evaluate("""() => {
+            const labels = document.querySelectorAll('label, span, div');
+            for (const el of labels) {
+                if (el.textContent && /non.?ip5/i.test(el.textContent)) {
+                    const cb = el.querySelector('input[type="checkbox"]') 
+                           || el.previousElementSibling 
+                           || el.nextElementSibling;
+                    if (cb && cb.type === 'checkbox') {
+                        if (!cb.checked) { cb.click(); cb.dispatchEvent(new Event('change', {bubbles:true})); }
+                        return true;
+                    }
+                }
+            }
+            // 最后兜底：查找所有 checkbox，点击未选中的（排除搜索表单中的）
+            const allCb = document.querySelectorAll('input[type="checkbox"]');
+            for (const cb of allCb) {
+                const ctx = cb.closest('form') || cb.parentElement;
+                if (ctx && !/pfsearch/i.test(ctx.id || '')) {
+                    if (!cb.checked) { cb.click(); cb.dispatchEvent(new Event('change', {bubbles:true})); }
+                    return true;
+                }
+            }
+            return false;
+        }""")
+        if js_checked:
+            print("    NON-IP5 Office 复选框已通过 JS 勾选")
+        else:
+            print("    [WARN] 未能勾选 NON-IP5 Office，部分非五局同族成员可能缺失")
+
+    # 等待 NON-IP5 数据加载
+    await page.wait_for_timeout(5000)
+
+    # ── 分页加载：点击 "Load Next X records" 按钮直到全部加载
+    print("    检查分页加载 ...")
+    max_load_rounds = 20  # 防止无限循环
+    for round_idx in range(max_load_rounds):
+        load_btn_found = False
+        # 尝试匹配 "Load Next N records" 按钮
+        for selector in [
+            'button:has-text("Load Next")',
+            'a:has-text("Load Next")',
+            'button:has-text("load next")',
+            'a:has-text("load next")',
+        ]:
+            try:
+                loc = page.locator(selector).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    btn_text = await loc.text_content()
+                    print(f"    点击分页按钮: {btn_text.strip()}")
+                    await loc.click(timeout=5000)
+                    await page.wait_for_timeout(4000)
+                    load_btn_found = True
+                    break
+            except Exception:
+                continue
+        
+        if not load_btn_found:
+            # 尝试 JS 兜底查找
+            js_result = await page.evaluate("""() => {
+                const btns = document.querySelectorAll('button, a, [role="button"]');
+                for (const btn of btns) {
+                    const txt = btn.textContent || '';
+                    if (/load\s+next/i.test(txt)) {
+                        btn.click();
+                        return txt.trim();
+                    }
+                }
+                return null;
+            }""")
+            if js_result:
+                print(f"    通过 JS 点击分页按钮: {js_result}")
+                await page.wait_for_timeout(4000)
+            else:
+                print("    分页加载完成（无更多记录）")
+                break
+
     page_text = await page.evaluate("document.body.innerText")
     page_html = await page.evaluate("document.documentElement.outerHTML")
 
@@ -107,11 +215,35 @@ async def search_patent(page, app_number: str) -> dict:
 # ──────────────────────────────────────────────
 # Step 2: 从 HTML 提取所有 View Dossier 链接
 # ──────────────────────────────────────────────
+# 专利局排序优先级（用于报告输出排序）
+OFFICE_ORDER = {
+    "US": 0,
+    "EP": 1,
+    "JP": 2,
+    "KR": 3,
+    "CN": 4,
+    "WIPO": 5,
+    "PCT": 6,
+    # 其他局排在最后，按字母序
+}
+
+
+def office_sort_key(office: str) -> tuple[int, str]:
+    """返回排序 key：(优先级序号, 局名)。非 IP5 局优先级为 99。"""
+    return (OFFICE_ORDER.get(office, 99), office)
+
+
 def extract_family_links(html: str) -> list[dict]:
-    """解析同族页面 HTML，提取每个成员的 View Dossier URL 和元信息。"""
+    """
+    解析同族页面 HTML，提取每个成员的 View Dossier URL 和元信息。
+    
+    去重策略：基于 OFFICE+APP_NUM 组合去重，同一案号只保留第一个链接。
+    （Global Dossier 中同一案号可能对应多个 GD_ID / 案卷视图，实际为同一申请。）
+    """
     soup = BeautifulSoup(html, "html.parser")
     links = []
-    seen = set()
+    seen = set()          # 用于 href 级别去重（去掉 /true 重复）
+    seen_members = set()  # 用于 OFFICE+APP_NUM 级别去重
 
     for a in soup.find_all("a"):
         href = a.get("href", "")
@@ -129,6 +261,12 @@ def extract_family_links(html: str) -> list[dict]:
             continue
         office, app_num, app_type, gd_id = m.groups()
 
+        # 基于 OFFICE+APP_NUM 去重
+        member_key = f"{office}_{app_num}"
+        if member_key in seen_members:
+            continue
+        seen_members.add(member_key)
+
         # 获取申请号展示文字
         sr = a.find("span", class_="sr-only")
         label = sr.get_text(strip=True) if sr else a.get_text(strip=True)
@@ -142,6 +280,9 @@ def extract_family_links(html: str) -> list[dict]:
             "url": full_url,
             "label": label,
         })
+
+    # 按专利局优先级排序：US → EP → JP → KR → CN → WIPO → Others
+    links.sort(key=lambda lk: office_sort_key(lk["office"]))
 
     return links
 
@@ -313,8 +454,28 @@ def extract_most_recent_docs(text: str, n: int = 5) -> list[dict]:
 
 
 def generate_report(app_number: str, search_result: dict, members_data: list[dict]) -> str:
-    """生成 Markdown 格式的全球审查档案报告。"""
+    """生成 Markdown 格式的全球审查档案报告，按专利局分组排序。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # 专利局分组名映射
+    OFFICE_DISPLAY = {
+        "US": "🇺🇸 美国专利局（USPTO）",
+        "EP": "🇪🇺 欧洲专利局（EPO）",
+        "JP": "🇯🇵 日本特许厅（JPO）",
+        "KR": "🇰🇷 韩国特许厅（KIPO）",
+        "CN": "🇨🇳 中国国家知识产权局（CNIPA）",
+        "WIPO": "🌐 世界知识产权组织（WIPO/PCT）",
+        "PCT": "🌐 世界知识产权组织（WIPO/PCT）",
+    }
+    OTHER_OFFICE_DISPLAY = "🌍 其他专利局（NON-IP5）"
+
+    # 按专利局优先级排序
+    sorted_members = sorted(members_data, key=lambda m: office_sort_key(m["office"]))
+
+    # 统计
+    office_counts = {}
+    for m in sorted_members:
+        office_counts[m["office"]] = office_counts.get(m["office"], 0) + 1
     
     report = f"""# 全球专利审查档案报告
 
@@ -326,22 +487,34 @@ def generate_report(app_number: str, search_result: dict, members_data: list[dic
 
 ## 一、专利家族概览
 
-共发现 **{len(members_data)} 个**同族成员：
+共发现 **{len(sorted_members)} 个**去重同族成员，分布于 **{len(office_counts)} 个**专利局：
 
 | # | 专利局 | 申请号 | 审查状态 |
-|---|--------|--------|---------|
+|---|--------|--------|----------|
 """
-    for i, m in enumerate(members_data, 1):
+    for i, m in enumerate(sorted_members, 1):
         status = extract_status_from_text(m["all_docs_text"], m["office"])
         report += f"| {i} | {m['office']} | {m['app_num']} | {status} |\n"
 
     report += "\n---\n\n## 二、各成员详细审查信息\n\n"
 
-    for m in members_data:
+    # 按专利局分组输出
+    current_section = None
+    for m in sorted_members:
         key = m["key"]
         office = m["office"]
         app_num = m["app_num"]
         status = extract_status_from_text(m["all_docs_text"], office)
+
+        # 判断分组标题
+        if office in OFFICE_DISPLAY:
+            section_title = OFFICE_DISPLAY[office]
+        else:
+            section_title = OTHER_OFFICE_DISPLAY
+
+        if section_title != current_section:
+            current_section = section_title
+            report += f"## {section_title}\n\n"
 
         report += f"### {office} — {app_num}\n\n"
         report += f"- **档案链接：** {m['url']}\n"
@@ -366,19 +539,24 @@ def generate_report(app_number: str, search_result: dict, members_data: list[dic
 
         report += "\n"
 
-        # Office Action 摘要（如果有）
-        pf_text = m.get("patent_fam_text", "")
-        if pf_text and len(pf_text) > 200:
-            # 截取 Patent Family 视图中的状态信息
-            lines = [l.strip() for l in pf_text.splitlines() if l.strip()]
-            pf_snippet = "\n".join(lines[:30])
-            report += "#### Patent Family 视图摘要\n\n"
-            report += f"```\n{pf_snippet}\n```\n\n"
+    # 状态汇总
+    report += "---\n\n## 三、审查状态汇总\n\n"
+    status_summary = {}
+    for m in sorted_members:
+        status = extract_status_from_text(m["all_docs_text"], m["office"])
+        if status not in status_summary:
+            status_summary[status] = []
+        status_summary[status].append(f"{m['office']}-{m['app_num']}")
 
-    report += "---\n\n## 三、说明\n\n"
-    report += """- 本报告基于 USPTO Global Dossier 公开数据自动生成，数据实时性依赖 USPTO 与各专利局的数据同步。  
-- "Most Recent Documents" 为各局档案中按日期降序排列的最新文件。  
-- 如需查看完整文件列表或下载原始文档，请访问上方各档案链接。  
+    report += "| 状态 | 数量 | 成员 |\n|------|------|------|\n"
+    for status, members in sorted(status_summary.items(), key=lambda x: x[1], reverse=True):
+        report += f"| {status} | {len(members)} | {', '.join(members)} |\n"
+
+    report += "\n---\n\n## 四、说明\n\n"
+    report += """- 本报告基于 USPTO Global Dossier 公开数据自动生成，数据实时性依赖 USPTO 与各专利局的数据同步。
+- "Most Recent Documents" 为各局档案中按日期降序排列的最新文件。
+- 同族成员已按 OFFICE+APP_NUM 去重，同一申请号仅保留一个档案视图。
+- 如需查看完整文件列表或下载原始文档，请访问上方各档案链接。
 - 审查状态为基于页面文本关键词的自动识别，可能存在误差，请以各局官方系统为准。
 """
 
